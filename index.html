@@ -1,0 +1,874 @@
+<!-- 
+REQUIREMENTS
+GitHub version contains only this file, so we are sure are not violating any
+policies or licences. Respective JavaScript libs can be found on the following 
+resources:
+jQuery (jquery.js) - http://jquery.com/
+jQueryMouseWheel(jQuery_mousewheel_plugin.js) - http://www.ogonek.net/mousewheel/jquery-demo.html
+html2canvas(html2canvas.js) - http://html2canvas.hertzen.com/
+WebGL libs(glMatrix.js, webgl-utils.js) - http://learningwebgl.com/blog/?page_id=1217
+Color Quantization (quantize.js) - https://gist.github.com/1104622
+
+
+NOTES
+1) This application requires internet connection to function (since site screenshot must pass through
+html2canvas proxy (read more about external resources being loaded to cavas using html2canvas function
+at http://html2canvas.hertzen.com/)
+2) Some sites won't load, due canvas security issues (I will not explain this better then Simon Sarris
+on his blog: http://simonsarris.com/blog/480-understanding-the-html5-canvas-image-security-rules)
+3) You need WebGL configured on your machine (google how this configuration must be done). Our application
+was tested on 3 machines (one of which with linux based os, was not able to render WebGL canvas) and was 
+running on latest releases of Firefox and Chrome smothly.
+4) Application has target page height limit (the page you want to be shown in 3D), due inefficiency of our 
+algorithms and limitations of WebGL (pages which has many colors will take eternity to load :D, so choose 
+simple ones :P)
+
+CREDITS
+Andriy Boychenko - user interaction
+Rafael Schimassek - pixel clustering algorithm
+Serhiy Boychenko - rest of engine
+
+SPECIAL THANKS
+Codebits 2012 for giving this excellent opportunity to test our skills, implement some of the most challenging
+and interesting ideas
+All stuff, for coffee, food, security, help with restore power on our table, any other help they gave us.
+Our parents, wifes, cats and dogs, ofcourse, just because they are who they are and give us support in every
+step we make (well support part doesn't include cats and dogs :P)
+Google, Stackoverflow, etc
+-->
+
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>3D Web - Codebits 2012 48H Programming Contest</title>
+
+<script src="glMatrix.js" type="text/javascript"></script>
+<script src="webgl-utils.js" type="text/javascript"></script>
+
+<script id="shader-fs" type="x-shader/x-fragment">
+    precision mediump float;
+
+    varying vec4 vColor;
+
+    void main(void) {
+        gl_FragColor = vColor;
+    }
+</script>
+
+<script id="shader-vs" type="x-shader/x-vertex">
+    attribute vec3 aVertexPosition;
+    attribute vec4 aVertexColor;
+
+    uniform mat4 uMVMatrix;
+    uniform mat4 uPMatrix;
+
+    varying vec4 vColor;
+
+    void main(void) {
+        gl_Position = uPMatrix * uMVMatrix * vec4(aVertexPosition, 1.0);
+        vColor = aVertexColor;
+    }
+</script>
+
+
+<script type="text/javascript">
+
+    var gl;
+    var perspective_angle = 45;
+    var vision_radius = 20; //200
+    var vision_angle = 0.5*Math.PI;
+    var vision_increment = 0.05;
+	var observatorPos = new Array(vision_radius*Math.cos(vision_angle), 0.0, vision_radius*Math.sin(vision_angle));
+	var observatorLoc = new Array(0.0, 0.0, -200.0);
+	var observatorOrientation = 0;
+	var zoom_counter = 0.1;
+	
+    function initGL(canvas) {
+        try {
+            gl = canvas.getContext("experimental-webgl");
+            gl.viewportWidth = canvas.width;
+            gl.viewportHeight = canvas.height;
+        } catch (e) {
+        }
+        if (!gl) {
+            alert("Could not initialise WebGL, sorry :-(");
+        }
+    }
+
+
+    function getShader(gl, id) {
+        var shaderScript = document.getElementById(id);
+        if (!shaderScript) {
+            return null;
+        }
+
+        var str = "";
+        var k = shaderScript.firstChild;
+        while (k) {
+            if (k.nodeType == 3) {
+                str += k.textContent;
+            }
+            k = k.nextSibling;
+        }
+
+        var shader;
+        if (shaderScript.type == "x-shader/x-fragment") {
+            shader = gl.createShader(gl.FRAGMENT_SHADER);
+        } else if (shaderScript.type == "x-shader/x-vertex") {
+            shader = gl.createShader(gl.VERTEX_SHADER);
+        } else {
+            return null;
+        }
+
+        gl.shaderSource(shader, str);
+        gl.compileShader(shader);
+
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            alert(gl.getShaderInfoLog(shader));
+            return null;
+        }
+
+        return shader;
+    }
+
+
+    var shaderProgram;
+
+    function initShaders() {
+        var fragmentShader = getShader(gl, "shader-fs");
+        var vertexShader = getShader(gl, "shader-vs");
+
+        shaderProgram = gl.createProgram();
+        gl.attachShader(shaderProgram, vertexShader);
+        gl.attachShader(shaderProgram, fragmentShader);
+        gl.linkProgram(shaderProgram);
+
+        if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+            alert("Could not initialise shaders");
+        }
+
+        gl.useProgram(shaderProgram);
+
+        shaderProgram.vertexPositionAttribute = gl.getAttribLocation(shaderProgram, "aVertexPosition");
+        gl.enableVertexAttribArray(shaderProgram.vertexPositionAttribute);
+
+        shaderProgram.vertexColorAttribute = gl.getAttribLocation(shaderProgram, "aVertexColor");
+        gl.enableVertexAttribArray(shaderProgram.vertexColorAttribute);
+
+        shaderProgram.pMatrixUniform = gl.getUniformLocation(shaderProgram, "uPMatrix");
+        shaderProgram.mvMatrixUniform = gl.getUniformLocation(shaderProgram, "uMVMatrix");
+    }
+
+
+    var mvMatrix = mat4.create();
+    var mvMatrixStack = [];
+    var pMatrix = mat4.create();
+
+    function mvPushMatrix() {
+        var copy = mat4.create();
+        mat4.set(mvMatrix, copy);
+        mvMatrixStack.push(copy);
+    }
+
+    function mvPopMatrix() {
+        if (mvMatrixStack.length == 0) {
+            throw "Invalid popMatrix!";
+        }
+        mvMatrix = mvMatrixStack.pop();
+    }
+
+
+    function setMatrixUniforms() {
+        gl.uniformMatrix4fv(shaderProgram.pMatrixUniform, false, pMatrix);
+        gl.uniformMatrix4fv(shaderProgram.mvMatrixUniform, false, mvMatrix);
+    }
+
+
+    function degToRad(degrees) {
+        return degrees * Math.PI / 180;
+    }
+
+    var squareVertexPositionBuffer;
+    var squareVertexColorBuffer;
+
+    function initBuffers() {
+		squareVertexPositionBuffer = new Array();
+		squareVertexColorBuffer = new Array();
+    }
+
+    function drawScene() {
+        gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+		mat4.perspective(perspective_angle, gl.viewportWidth / gl.viewportHeight, 0.1, 500.0, pMatrix);
+		
+        mat4.identity(mvMatrix);
+		mat4.lookAt([observatorPos[0],observatorPos[1],observatorPos[2]],[observatorLoc[0],observatorLoc[1],observatorLoc[2]],[0,1,0],mvMatrix);
+		mat4.translate(mvMatrix, [0.0 , 0.0, -200.0]);
+
+		for (var c = 0; c < squareVertexPositionBuffer.length; c ++) {
+			mvPushMatrix();
+			
+			gl.bindBuffer(gl.ARRAY_BUFFER, squareVertexPositionBuffer[c]);
+			gl.vertexAttribPointer(shaderProgram.vertexPositionAttribute, squareVertexPositionBuffer[c].itemSize, gl.FLOAT, false, 0, 0);
+
+			gl.bindBuffer(gl.ARRAY_BUFFER, squareVertexColorBuffer[c]);
+			gl.vertexAttribPointer(shaderProgram.vertexColorAttribute, squareVertexColorBuffer[c].itemSize, gl.FLOAT, false, 0, 0);
+
+			setMatrixUniforms();
+			gl.drawArrays(gl.TRIANGLE_STRIP, 0, squareVertexPositionBuffer[c].numItems);
+			
+			mvPopMatrix();
+		}
+    }
+
+
+    var lastTime = 0;
+
+    function animate() {
+        /*var timeNow = new Date().getTime();
+        if (lastTime != 0) {
+            var elapsed = timeNow - lastTime;
+
+            rTri += (90 * elapsed) / 1000.0;
+            rSquare += (75 * elapsed) / 1000.0;
+        }
+        lastTime = timeNow;*/
+    }
+
+
+    function tick() {
+        requestAnimFrame(tick);
+        drawScene();
+        animate();
+    }
+
+
+    function webGLInit() {
+        var canvas = document.getElementById("webpage");
+        initGL(canvas);
+        initShaders();
+        //initBuffers();
+    }
+	
+	function webGLStart () {
+		gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.enable(gl.DEPTH_TEST);
+
+        tick();
+	}
+
+</script>
+</head>
+<body>
+<script src="jquery.js" type="text/javascript"></script>
+<script src="html2canvas.js" type="text/javascript"></script>
+<script src="quantize.js" type="text/javascript"></script>
+<script type="text/javascript" src="jQuery_mousewheel_plugin.js"></script>
+<script type="text/javascript">
+var date = new Date();
+var proxyUrl = "http://html2canvas.appspot.com";
+
+var resultPixelArray = new Array();
+var zones = new Array();
+var tolerance = 0;
+var numrecs;
+
+var ignoreColor;
+
+var DEBUG;
+
+$(function () {
+	
+	/* PIXEL CLUSTERING ALGORITHM */
+	// any questions must be directed to Rafael
+	
+	var calcDifference = function ( px1 , px2, pos) {
+		//console.log("Tolerance = "+(Math.abs(px1.r-px2.r) + Math.abs(px1.g-px2.g) + Math.abs(px1.b-px2.b)), px1, px2, pos);
+		return Math.abs(px1.r-px2.r) + Math.abs(px1.g-px2.g) + Math.abs(px1.b-px2.b);
+	}; 
+	
+	var recJoin = function (xini, yini, xfim, yfim) {
+		//console.log("ON - ("+xini+","+yini+") - ("+xfim+","+yfim+")");
+		numrecs++;
+		//end condition
+		if ( xini >= xfim || yini >= yfim ) return;
+		
+		var inicolor = resultPixelArray[xini][yini];
+		var x = xini+1, y = yini+1;
+		
+		//first expand horizontally
+		while ( x < xfim ) {
+			if ( calcDifference( inicolor, resultPixelArray[x][yini],  {p1x:xini,p1y:yini,p2x:x,p2y:yini} ) <= tolerance ) {
+				x++;
+				continue;
+			}
+			break;
+		}
+		
+		//now expand vertically
+		var pass, i;
+		while ( y < yfim ) {
+			pass = true;
+			for ( i = xini; i < x; ++i ) {
+				if ( ! (calcDifference( inicolor, resultPixelArray[i][y], {p1x:xini,p1y:yini,p2x:i,p2y:y}) <= tolerance ) ) {
+					pass = false;
+					break;
+				}
+			}
+			if ( pass ) {
+				y++;
+				continue;
+			}
+			break;
+		}
+		
+		//recurse the other parts
+		//
+		// zzzooooooo
+		// zzzooooooo
+		// mmmmmmmmmm
+		// mmmmmmmmmm
+		//
+		zones.push( { xi:xini, yi:yini, xf:x-1, yf:y-1 } );
+		//console.log("FROM - ("+xini+","+yini+") - ("+xfim+","+yfim+") -> "+((xfim-xini)*(yfim-yini)));
+		//console.log("PUSHED - ("+xini+","+yini+") - ("+(x-1)+","+(y-1)+")");
+		//console.log("CALL - ("+x+","+yini+") - ("+xfim+","+y+")");
+		//console.log("CALL - ("+xini+","+y+") - ("+x+","+yfim+")");
+		//console.log("CALL - ("+x+","+y+") - ("+xfim+","+yfim+")");
+		//console.log("CALL - ("+x+","+yini+") - ("+xfim+","+yfim+")");
+		//console.log("CALL - ("+xini+","+y+") - ("+x+","+yfim+")");
+		recJoin( x, yini, xfim, y ); // o
+		recJoin( xini, y, xfim, yfim ); // m
+		//recJoin( x, yini, xfim, y ); // o
+		//recJoin( xini, y, x, yfim ); // m
+		//recJoin( x, y, xfim, yfim ); // s
+		//recJoin( x, yini, xfim, yfim ); // o
+		//recJoin( xini, y, x, yfim ); // m
+		
+	};
+    var a, b;
+    $('input[type="button"]').click(function () {
+        $(a.contentWindow).unbind("load");
+        $(a).contents().find("body").html2canvas({
+            canvasHeight: b.body.scrollHeight,
+            canvasWidth: b.body.scrollWidth,
+            logging: true
+        })
+    });
+	$("#compute").click(function () {
+	
+		DEBUG = $('#debug').is(':checked');
+	
+		var imageCanvas = $("#image_canvas")[0];
+		// Setting the max height of the canvas element, so big pages will not render (and block user machine perhaps)
+		var maxCanvasHeight = 500;
+		if (imageCanvas.height < 500) {
+			maxCanvasHeight = imageCanvas.height;
+		}
+		
+		// Get the data from canvas ( obtaining the pixel color array and the list of existing colors)
+		var canvasContext = imageCanvas.getContext('2d');
+		var imageDataPixels = canvasContext.getImageData(0, 0, imageCanvas.width, maxCanvasHeight).data;
+		var pixelArray = new Array(imageCanvas.width);
+		pixelArrayColorIndex = new Array(imageCanvas.width);
+		var colorArray = new Array();
+		for (var x_count = 0, count = 0; x_count < imageCanvas.width; x_count ++ ) {
+			pixelArray[x_count] = new Array(maxCanvasHeight);
+			pixelArrayColorIndex[x_count] = new Array(maxCanvasHeight);
+			for (var y_count = 0; y_count < maxCanvasHeight; y_count ++) {
+				pixelArray[x_count][y_count] = new Color(imageDataPixels[count],imageDataPixels[count+1],imageDataPixels[count+2]);
+				count = count + 4;
+				var added = false;
+				for (var c_count = 0; c_count < colorArray.length; c_count++) {
+					if (colorArray[c_count].r==pixelArray[x_count][y_count].r &&
+					    colorArray[c_count].g==pixelArray[x_count][y_count].g &&
+						colorArray[c_count].b==pixelArray[x_count][y_count].b) {
+						colorArray[c_count].occurence = colorArray[c_count].occurence + 1;
+						pixelArrayColorIndex[x_count][y_count] = c_count;
+						added = true;
+						break;
+					}
+				}
+				if (!added) {
+					colorArray[c_count] = new Color (pixelArray[x_count][y_count].r,pixelArray[x_count][y_count].g,pixelArray[x_count][y_count].b);
+					colorArray[c_count].occurence = 1;
+					//pixelArray[x_count][y_count] = c_count;
+					pixelArrayColorIndex[x_count][y_count] = c_count;
+				}
+			}
+		}
+		
+		// Defines limit of the colors to be used on image
+		var maxColors = 50;
+		
+		// Prepare the data to format accepted by the lib
+		var notQuantizedPixels = new Array(colorArray.length);
+		for (var q_count = 0; q_count < colorArray.length; q_count ++) {
+			notQuantizedPixels[q_count] = new Array(3);
+			notQuantizedPixels[q_count][0] = colorArray[q_count].r;
+			notQuantizedPixels[q_count][1] = colorArray[q_count].g;
+			notQuantizedPixels[q_count][2] = colorArray[q_count].b;
+		}
+		
+		// Quantize colors
+		var cmap = MMCQ.quantize(notQuantizedPixels, maxColors);
+		var newPalette = cmap.palette();
+		var quantizedPixels = notQuantizedPixels.map(function(p) { 
+			return cmap.map(p); 
+		});
+		
+		// Calculate pixel occurence (after quantization)
+		var pixelDensity = new Array();
+		for (var c_count = 0; c_count < quantizedPixels.length; c_count++) {
+			var found = false;
+			for (var cc_count = 0; cc_count < pixelDensity.length; cc_count++) {
+				if (pixelDensity[cc_count].r == quantizedPixels[c_count][0] &&
+					pixelDensity[cc_count].g == quantizedPixels[c_count][1] &&
+					pixelDensity[cc_count].b == quantizedPixels[c_count][2]) {
+						found = true;
+						pixelDensity[cc_count].occurence = pixelDensity[cc_count].occurence + colorArray[c_count].occurence ;
+						break;
+					}
+			}
+			
+			if (!found) {
+				pixelDensity[cc_count] = { r:quantizedPixels[c_count][0], g:quantizedPixels[c_count][1], b:quantizedPixels[c_count][2], occurence:colorArray[c_count].occurence};
+			}
+		}
+		
+		pixelDensity.sort(pixelOccurenceComparison);
+
+		// Put back the colors to the pixel array
+		for (var x_count = 0; x_count < imageCanvas.width; x_count ++ ) {
+			for (var y_count = 0; y_count < maxCanvasHeight; y_count ++) {
+				colorIndex = pixelArrayColorIndex[x_count][y_count];
+				pixelArray[x_count][y_count] = new Color(quantizedPixels[colorIndex][0],quantizedPixels[colorIndex][1],quantizedPixels[colorIndex][2]);
+			}
+		}
+		
+		// Generate new canvas content with quantized data
+		element = document.getElementById("result_image_canvas");
+		context = element.getContext("2d");
+		//canvasContext.globalAlpha = 1;
+		
+		element.width=imageCanvas.width;
+		element.height=maxCanvasHeight;
+
+		var count = 0;
+		imageData = context.createImageData(imageCanvas.width, maxCanvasHeight);
+		for (var x_count = 0, count = 0; x_count < imageCanvas.width; x_count ++ ) {
+			for (var y_count = 0; y_count < maxCanvasHeight; y_count ++) {
+				imageData.data[count] = pixelArray[x_count][y_count].r;
+				imageData.data[count+1] = pixelArray[x_count][y_count].g;
+				imageData.data[count+2] = pixelArray[x_count][y_count].b;
+				imageData.data[count+3] = 255;
+				
+				//canvasContext.fillStyle = "rgb("+pixelArray[x_count][y_count].r+","+pixelArray[x_count][y_count].g+","+pixelArray[x_count][y_count].b+")";
+				//canvasContext.fillRect( x_count, y_count, 1, 1);
+				
+				count = count + 4;
+			}
+		}
+		
+		/*for ( var i = 0; i < zones.length; ++i ) {
+			context.fillStyle = "rgb("+Math.floor((Math.random()*100)+51)+","+Math.floor((Math.random()*100)+101)+","+Math.floor((Math.random()*100)+101)+")";
+			canvasContext.fillRect( zones[i].xi, zones[i].yi, zones[i].xf-zones[i].xi+1, zones[i].yf-zones[i].yi+1 );
+		} */
+		
+		context.putImageData(imageData, 0, 0);
+		
+		// retrieve pixel color from new canvas with quantized pixels image (due to some reason 
+		// wasn't able to get those from any of the array, despite using same array for drawing this canvas
+		var r, c, loc;
+		resultPixelArray = new Array();
+		var resultImageCanvas = $("#result_image_canvas")[0];
+		var resultCanvasContext = resultImageCanvas.getContext('2d');
+		var resultImageData = resultCanvasContext.getImageData(0, 0, resultImageCanvas.width, resultImageCanvas.height).data;
+		for ( c = 0; c < resultImageCanvas.width; ++c ) {
+			resultPixelArray[c] = new Array();
+			for ( r = 0; r < resultImageCanvas.height; ++r ) {
+				loc = ((resultImageCanvas.width * r) + c) * 4;
+				resultPixelArray[c][r] = { r:resultImageData[loc], g:resultImageData[loc+1], b:resultImageData[loc+2] };
+			}
+		}
+		
+		// pixel clustering calculation (recursive call to the function described above)
+		zones = new Array();
+		numrecs = 0;
+		//console.log(quantizedPixels);
+		recJoin(0, 0, resultImageCanvas.width, resultImageCanvas.height);
+		
+		if (DEBUG) {
+			// This draws calculated zones on quantized color image canvas
+			context.globalAlpha = 1;
+			for ( var i = 0; i < zones.length; ++i ) {
+				context.fillStyle = "rgb("+Math.floor((Math.random()*100)+51)+","+Math.floor((Math.random()*100)+101)+","+Math.floor((Math.random()*100)+101)+")";
+				context.fillRect( zones[i].xi, zones[i].yi, zones[i].xf-zones[i].xi+1, zones[i].yf-zones[i].yi+1 );
+			} 
+			
+			console.log("NumPixels = ", resultImageCanvas.width*resultImageCanvas.height);
+			console.log("NumZones = ", zones.length);
+			console.log("NumRecCalls = ", numrecs);
+			
+			console.log("CLUSTERING and QUANTIZATION COMPRESSION: " + ((1-(zones.length/(resultImageCanvas.width*resultImageCanvas.height)))*100) + " %");
+		}
+		
+		// Update the size of WebGL canvas
+		$("#webpage").width(imageCanvas.width).height(imageCanvas.width);
+		
+		webGLInit();
+		
+		//console.log("webGLInit done");
+		
+		initBuffers();
+		
+		//console.log("bufferes initiated");
+	
+		// this value serves to know to how many units the pixel will correspond 
+		// when rendered to WebGL scene
+		var valuePerPixelGL = 300/imageCanvas.width;
+		var totalShapesDrawn = 0;
+		
+		// Retrieves color to be ignored on shapes drawing
+		ignoreColor = pixelDensity[0];
+		
+		for ( var i = 0; i < zones.length; i++ ) {
+			// Get quantized color of the shape
+			loc = ((resultImageCanvas.width * zones[i].yi) + zones[i].xi) * 4;
+			var color = { r:resultImageData[loc], g:resultImageData[loc+1], b:resultImageData[loc+2] };
+			for (var c = 0; c < colorArray.length; c++) {
+				if (colorArray[c].r==color.r &&
+					colorArray[c].g==color.g &&
+					colorArray[c].b==color.b) {
+					color = { r:quantizedPixels[c][0], g:quantizedPixels[c][1], b:quantizedPixels[c][2] };
+					break ;
+				}
+			}
+			/*for (var k=0; k < 4; k++) {
+				colorsGL = colorsGL.concat([color.r/255, color.g/255, color.b/255 , 1.0]);
+				//colorsGL = colorsGL.concat([0.0, 1.0, 0.0, 1.0]);
+			}*/
+			//console.log(colorsGL);
+			var heightGL = (Math.random()*20); // will be based on density color, the more dense the color is the lower it will be
+			
+			// Translate shape color (to be rendered by WebGL)
+			if (color.r != ignoreColor.r &&
+				color.g != ignoreColor.g &&
+				color.b != ignoreColor.b) {
+				
+				var colors = [
+					[color.r/255, color.g/255, color.b/255 , 1.0], // Front face
+					[color.r/255, color.g/255, color.b/255 , 1.0], // Back face
+					[color.r/255, color.g/255, color.b/255 , 1.0], // Top face
+					[color.r/255, color.g/255, color.b/255 , 1.0], // Bottom face
+					[color.r/255, color.g/255, color.b/255 , 1.0], // Right face
+					[color.r/255, color.g/255, color.b/255 , 1.0]  // Left face
+				];
+				var colorsGL = [];
+				for (var k in colors) {
+					var colorAux = colors[k];
+					for (var j=0; j < 4; j++) {
+						colorsGL = colorsGL.concat(colorAux);
+					}
+				}
+
+				// Calculate shape height
+				var heightGL = 0;
+				var randomHeight = $('#random_height').is(':checked');
+				if(!randomHeight) {
+					for (var c = 0; c < pixelDensity.length; c++) {
+						if (pixelDensity[c].r == color.r &&
+							pixelDensity[c].g == color.g &&
+							pixelDensity[c].b == color.b) {
+							heightGL = Math.max(255-pixelDensity[c].r,255-pixelDensity[c].g,255-pixelDensity[c].b)/16;
+							break;
+						}
+					}
+				} else {
+					heightGL = Math.random()*20;
+				}
+	
+				// Draw rectangular shapes
+				var xiGL = (zones[i].xi - imageCanvas.width/2)*valuePerPixelGL;
+				var xfGL =(zones[i].xf+1 - imageCanvas.width/2)*valuePerPixelGL;
+				var yiGL = (zones[i].yi - maxCanvasHeight/2)*valuePerPixelGL;
+				var yfGL = (zones[i].yf +1 - maxCanvasHeight/2)*valuePerPixelGL;
+				
+				var verticesGL = [
+				
+						// Front face
+						xfGL,  -yfGL,  heightGL,
+						xiGL,  -yfGL,  heightGL,
+						xfGL,  -yfGL,  0.0,
+						xiGL,  -yfGL,  0.0,
+
+						// Back face
+						xiGL,  -yiGL,  heightGL,
+						xfGL,  -yiGL,  heightGL,
+						xiGL,  -yiGL,  0.0,
+						xfGL,  -yiGL,  0.0,
+				
+						// Top
+						xfGL,  -yiGL,  heightGL,
+						xiGL,  -yiGL,  heightGL,
+						xfGL,  -yfGL,  heightGL,
+						xiGL,  -yfGL,  heightGL,
+						
+						// Bottom
+						xfGL,  -yiGL,  0.0,
+						xiGL,  -yiGL,  0.0,
+						xfGL,  -yfGL,  0.0,
+						xiGL,  -yfGL,  0.0,
+						
+						// Right face
+						xfGL,  -yiGL,  heightGL,
+						xfGL,  -yfGL,  heightGL,
+						xfGL,  -yiGL,  0.0,
+						xfGL,  -yfGL,  0.0,
+
+						// Left face
+						xiGL,  -yfGL,  heightGL,
+						xiGL,  -yiGL,  heightGL,
+						xiGL,  -yfGL,  0.0,
+						xiGL,  -yiGL,  0.0
+					];
+					
+				squareVertexPositionBuffer[totalShapesDrawn] = gl.createBuffer();
+				gl.bindBuffer(gl.ARRAY_BUFFER, squareVertexPositionBuffer[totalShapesDrawn]);
+				gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verticesGL), gl.STATIC_DRAW);
+				squareVertexPositionBuffer[totalShapesDrawn].itemSize = 3;
+				squareVertexPositionBuffer[totalShapesDrawn].numItems = 24;
+
+				squareVertexColorBuffer[totalShapesDrawn] = gl.createBuffer();
+				gl.bindBuffer(gl.ARRAY_BUFFER, squareVertexColorBuffer[totalShapesDrawn]);
+				gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colorsGL), gl.STATIC_DRAW);
+				squareVertexColorBuffer[totalShapesDrawn].itemSize = 4;
+				squareVertexColorBuffer[totalShapesDrawn].numItems = 24;
+				
+				totalShapesDrawn++;
+			}
+		}
+		
+		// Draw the ignored color shape at "background"
+		var xiGL = (0 - imageCanvas.width/2)*valuePerPixelGL;
+		var xfGL =(imageCanvas.width - imageCanvas.width/2)*valuePerPixelGL;
+		var yiGL = (0 - maxCanvasHeight/2)*valuePerPixelGL;
+		var yfGL = (maxCanvasHeight - maxCanvasHeight/2)*valuePerPixelGL;
+		
+		var verticesGL = [	xfGL,  -yiGL,  0,
+							xiGL,  -yiGL,  0,
+							xfGL,  -yfGL,  0,
+							xiGL,  -yfGL,  0];
+		
+		squareVertexPositionBuffer[totalShapesDrawn] = gl.createBuffer();
+		gl.bindBuffer(gl.ARRAY_BUFFER, squareVertexPositionBuffer[totalShapesDrawn]);
+		gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verticesGL), gl.STATIC_DRAW);
+		squareVertexPositionBuffer[totalShapesDrawn].itemSize = 3;
+		squareVertexPositionBuffer[totalShapesDrawn].numItems = 4;
+		
+		colorsGL = [];
+		for (var i=0; i < 4; i++) {
+			colorsGL = colorsGL.concat([ignoreColor.r/255, ignoreColor.g/255, ignoreColor.b/255, 1.0]);
+		}
+
+		squareVertexColorBuffer[totalShapesDrawn] = gl.createBuffer();
+		gl.bindBuffer(gl.ARRAY_BUFFER, squareVertexColorBuffer[totalShapesDrawn]);
+		gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colorsGL), gl.STATIC_DRAW);
+		squareVertexColorBuffer[totalShapesDrawn].itemSize = 4;
+		squareVertexColorBuffer[totalShapesDrawn].numItems = 4;
+		
+		totalShapesDrawn++;
+		
+		if (DEBUG) {
+			console.log("TotalShapesDrawn: " + totalShapesDrawn);
+			console.log("COLOR IGNORE FILTER COMPRESSION: " + ((1-(totalShapesDrawn/zones.length))*100) + " % ");
+		}
+		
+		webGLStart();
+		
+		if (DEBUG)
+			console.log("webGLStart");
+		
+		if (!DEBUG) {
+			$("#content").remove();
+			$("#result_image_canvas").remove();
+		}
+
+		//Zoom in/out
+		var intOverallDelta = 0;
+		$("#webpage").mousewheel(function(objEvent, intDelta){
+			objEvent.preventDefault();
+			if (intDelta > 0){
+				intOverallDelta++;
+				perspective_angle = perspective_angle - 1.2;
+				zoom_counter += 0.05;
+			}
+			else if (intDelta < 0){
+				intOverallDelta--;
+				perspective_angle = perspective_angle + 1.2;
+				zoom_counter -= 0.05;
+			}
+			
+			//drawScene();
+		});
+		//KeyListners
+		$(document).keydown(function(e){
+			//37 - left
+			//38 - up
+			//39 - right
+			//40 - down
+			if (e.keyCode == 38) { 
+				observatorPos[1] = (observatorPos[1] + 5) ;
+				return false;
+			}
+			if (e.keyCode == 40) { 
+				observatorPos[1] = (observatorPos[1] - 5) ;
+				return false;
+			}
+			if (e.keyCode == 37) { 
+				vision_angle = vision_angle + 0.5;
+				vision_radius = 20;
+				observatorPos[1] = vision_radius*Math.cos(vision_angle) ;
+				observatorPos[0] = vision_radius*Math.sin(vision_angle) ;
+				return false;
+			}
+			if (e.keyCode == 39) { 
+				vision_angle = vision_angle - 0.5;
+				vision_radius = 20;
+				observatorPos[1] = vision_radius*Math.cos(vision_angle) ;
+				observatorPos[0] = vision_radius*Math.sin(vision_angle) ;
+				return false;
+			}
+			
+			
+
+			//observatorPos[0]=vision_radius*Math.cos(vision_angle);
+		});
+		
+		//mouse drag
+		$('#webpage').mousedown(function(e1) {
+			var prevX = e1.pageX
+			var prevY = e1.pageY;
+			$('#webpage').mousemove(function(e2) {
+				var currX = e2.pageX;
+				var currY = e2.pageY;
+				
+				
+				if(currY >= prevY){
+					observatorLoc[1] = observatorLoc[1] + 0.5+zoom_counter;
+					observatorPos[1] = observatorPos[1] + 0.5+zoom_counter;
+				}else{
+					observatorLoc[1] = observatorLoc[1] - 0.5-zoom_counter;
+					observatorPos[1] = observatorPos[1] - 0.5-zoom_counter;
+				}
+				
+				if(currX <= prevX){
+					observatorLoc[0] = observatorLoc[0] + 0.5+zoom_counter;
+					observatorPos[0] = observatorPos[0] + 0.5+zoom_counter;
+				}else{
+					observatorLoc[0] = observatorLoc[0] - 0.5-zoom_counter;
+					observatorPos[0] = observatorPos[0] - 0.5-zoom_counter;
+				}
+				
+				prevY = currY;
+				prevX = currX;
+				
+			});
+		});
+		$('#webpage').mouseup(function() {
+			$('#webpage').unbind('mousemove');
+		});
+			
+	});
+	
+
+	// Show the Pixel color of clicked area.
+	$("#preview").on( 'click', function(event) {
+		//event.offsetX, event.offsetY
+		pixel = $('#result_image_canvas')[0].getContext('2d').getImageData(
+			event.offsetX, event.offsetY, event.offsetX+1, event.offsetY+1
+			).data;
+		//console.log("["+event.offsetX+"]["+event.offsetY+"] => rgba( "+pixel[0]+" , "+pixel[1]+" , "+pixel[2]+" , "+pixel[3]+" )");
+	});
+	
+	$("#getscreenshot").click(function (d) {
+        d.preventDefault();
+        var c = $("#url").val();
+        var f = document.createElement("a");
+        f.href = c;
+        $.ajax({
+            data: {
+                xhr2: false,
+                url: f.href
+            },
+            url: proxyUrl,
+            dataType: "jsonp",
+            success: function (e) {
+                a = document.createElement("iframe");
+                $(a).css({
+                    visibility: "hidden"
+                }).width($(window).width()).height($(window).height());
+                $("#content").append(a);
+                b = a.contentWindow.document;
+                b.open();
+                $(a.contentWindow).load(function () {
+                    var g = $(a).contents().find("body"),
+                        h = {
+                            onrendered: function (j) {
+								j.id="image_canvas";
+                                $("#content").empty().append(j);
+                                $("base").attr("href", "")
+							},
+                            allowTaint: false,
+                            taintTest: false,
+                            //flashcanvas: "src/flashcanvas.min.js"
+                        }, 
+						i = html2canvas(g, h);
+                });
+				
+				//alert(f.hostname + " " + f.pathname)
+				
+				$("base").attr("href", f.protocol + "//" + f.hostname + "/" + f.pathname);
+                e = e.replace("<head>", "<head><base href='" + f.protocol + "//" + f.hostname + "/" + f.pathname + "' />");
+                b.write(e);
+                b.close()
+            }
+        })
+    })
+});
+
+function Color(r,g,b) {
+	this.r = r;
+	this.g = g;
+	this.b = b;
+	this.occurence = 0;
+}
+
+function pixelOccurenceComparison(a,b) {
+  if (a.occurence < b.occurence)
+     return 1;
+  if (a.occurence > b.occurence)
+    return -1;
+  return 0;
+}
+
+</script>
+
+
+
+Website URL:
+<input id="url" type="url" value="https://www.google.pt/">
+<button id="getscreenshot">1. Pick Web page!</button>
+<button id="compute">2. Make it happen!</button>
+<b>Options:</b>
+<input id="random_height" type="checkbox">Random height
+<input id="debug" type="checkbox">Debug Mode(will make it much slower)
+
+<div id="content">
+	<!--<canvas id="myCanvas" width="0" height="0"></canvas>-->
+</div>
+<div id="preview" style="margin:0px;padding:0px"><canvas id="result_image_canvas" width="0" height="0"></canvas></div>
+<canvas id="webpage" style="border: none;" width="500" height="500"></canvas>
+</body>
+</html>
